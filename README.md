@@ -169,3 +169,57 @@ Al ejecutar las reglas contra el código real aparecieron dos falsos positivos. 
 | `calculadorasImplementanInterfaz` | `SelectorCalculadora` vive en `procesamiento.calculo` pero no es una estrategia, es quien las elige | La regla aplica a las clases cuyo nombre empieza por `Calculadora` |
 
 Además, `@AnalyzeClasses` usa `ImportOption.DoNotIncludeTests` para que las reglas evalúen solo código de producción: las clases de prueba (`CalculadoraViajeTest`, etc.) comparten paquete con las calculadoras y no implementan la interfaz.
+
+---
+
+## 4. Qué se descartó y por qué
+
+Durante el diseño y la implementación aparecieron varias alternativas más sofisticadas que las que quedaron en el código. Para cada una se aplicó la misma pregunta de la Guía (sección 4.2): **¿la variabilidad que la justificaría es real y está documentada hoy, o es especulación sobre un futuro que aún no llegó?**
+
+Ningún descarte es definitivo: es la decisión vigente hoy, y cada uno indica qué señal haría reconsiderarlo.
+
+| # | Alternativa descartada | Principio que la descarta | Origen |
+|---|------------------------|---------------------------|--------|
+| 1 | Patrón State para el ciclo de vida de la solicitud | YAGNI | Propio |
+| 2 | Jerarquía de excepciones, una por validador | Test de explicabilidad | Propio |
+| 3 | Entidad JPA separada del dominio + mapper | YAGNI / KISS | Propio |
+| 4 | Topes y porcentajes externalizados a configuración | Rule of Three | Propio |
+| 5 | `ApplicationEventPublisher` en vez de la lista de observadores | Test de explicabilidad | Referencia del enunciado |
+| 6 | Visitor o Abstract Factory para exportar reportes | Rule of Three | Referencia del enunciado |
+
+### 4.1 Patrón State para el ciclo de vida de la solicitud
+
+- **Qué se consideró.** `EstadoSolicitud` tiene cuatro valores y `cambiarEstado` acepta cualquier transición, incluso `APROBADA → PENDIENTE`. Fue tentador modelar cada estado como una clase (`EstadoPendiente`, `EstadoAprobada`, …) con sus transiciones permitidas, que es el caso de libro del patrón State.
+- **Por qué se descartó.** State se justifica cuando el **comportamiento** del objeto cambia según su estado. En los tres requisitos la solicitud no hace nada distinto según su estado: solo lo almacena, y quien reacciona al cambio son los observadores. Tampoco hay ningún requisito que defina qué transiciones son válidas; inventarlas sería decidir reglas de negocio que le corresponden a Finanzas. Cuatro clases y una interfaz para envolver un `setEstado` es resolver un problema que el enunciado no plantea (YAGNI).
+- **Qué señal haría reconsiderar.** Que Finanzas defina reglas por estado: por ejemplo, que una solicitud en `REQUIERE_CORRECCION` pueda editarse y reenviarse pero una `APROBADA` no, o que rechazar exija un motivo. Incluso entonces, el primer paso sería una tabla de transiciones permitidas en el enum; State solo si además aparece comportamiento distinto por estado.
+
+### 4.2 Jerarquía de excepciones, una por validador
+
+- **Qué se consideró.** Crear `DocumentosFaltantesException`, `MontoExcedidoException` y `SolicitudDuplicadaException` (heredando de una base común) en lugar de una sola `SolicitudInvalidaException` con el motivo como texto.
+- **Por qué se descartó.** No pasa el test de explicabilidad: no pude completar la frase "necesito tres tipos de excepción porque…". Una jerarquía se justifica cuando alguien las **captura de forma distinta**, y aquí hay un único `@ExceptionHandler` que responde lo mismo para las tres: HTTP 422 con el motivo. Además iría en contra del RF1: cada verificación nueva obligaría a crear también su excepción, cuando hoy basta con una clase que devuelve `ResultadoValidacion.rechazar("…")`.
+- **Qué señal haría reconsiderar.** Que un cliente de la API necesite reaccionar por programa de forma distinta según la causa (por ejemplo, que el frontend abra el cargador de archivos solo cuando faltan documentos). Aun así, lo proporcional sería agregar un código de motivo a `ResultadoValidacion`, no una clase de excepción por validador.
+
+### 4.3 Entidad JPA separada del dominio, con mapper
+
+- **Qué se consideró.** El enunciado pide dos cosas que chocan: un dominio sin imports de JPA y un `JpaRepository<SolicitudReembolso, Long>` usado directamente. La salida "de arquitectura limpia" era crear `SolicitudReembolsoEntity` con las anotaciones, un `SolicitudReembolsoMapper` para convertir en ambos sentidos y un adaptador que envolviera el repositorio.
+- **Por qué se descartó.** Son tres clases nuevas para copiar nueve campos idénticos de un objeto a otro, y es exactamente el puerto de persistencia que ADR-001 rechaza por especulativo. Se resolvió con una herramienta más simple que ya trae JPA: el mapeo en `META-INF/orm.xml`. El dominio queda sin un solo import de `jakarta.persistence` y no existe modelo duplicado (KISS).
+- **Qué señal haría reconsiderar.** Que el esquema de la base de datos y el modelo de dominio empiecen a divergir (columnas que no corresponden a campos, una solicitud repartida en varias tablas) o que llegue el segundo origen de datos que menciona ADR-001. Mientras tabla y clase sean espejo, el mapper no traduce nada.
+
+### 4.4 Topes y porcentajes externalizados a configuración
+
+- **Qué se consideró.** Los topes (150.000 diario, 2.000.000 mensual, 3.000.000 anual) y el 80 % de capacitación están como constantes en las clases. Se pensó en moverlos a `application.yml` con `@ConfigurationProperties`, o a una tabla administrable, para que Finanzas los cambie sin desplegar.
+- **Por qué se descartó.** Nadie ha pedido cambiarlos. El RF2 habla de agregar **categorías con fórmulas nuevas**, que es código en cualquier caso, no de ajustar valores. No se cumple la Rule of Three: no ha habido ni un primer cambio de tope, mucho menos tres. Externalizarlos hoy agrega una clase de propiedades, validación de configuración y una fuente de errores nueva (un tope mal escrito en un archivo que nadie prueba), a cambio de una flexibilidad que nadie solicitó.
+- **Qué señal haría reconsiderar.** El primer cambio real de un tope se hace editando la constante. Si Finanzas los ajusta de forma recurrente (por ejemplo, cada año con el incremento del salario mínimo) o pide topes distintos por área o cargo, ahí sí hay variabilidad demostrada y se externalizan.
+- **Observación relacionada.** `ValidadorMontoMaximo` y las calculadoras tienen cada uno sus propias constantes de tope y no las comparten. Se dejó así a propósito: responden a requisitos distintos (RF1 es un techo por solicitud, RF2 es la fórmula de la categoría) y unificarlas las acoplaría sin que ningún requisito lo pida. Con los valores del enunciado el techo de la validación es igual o más estricto que el tope de la fórmula, de modo que el recorte de las calculadoras actúa como segunda barrera y se verifica en sus pruebas unitarias.
+
+### 4.5 Spring `ApplicationEventPublisher` en vez de una lista de observadores inyectada *(referencia del enunciado)*
+
+- **Qué se consideró.** Publicar un evento de dominio con `ApplicationEventPublisher` y reaccionar con `@EventListener`, como muestra la Guía (sección 2.3), en lugar de inyectar `List<ObservadorCambioEstado>` en el servicio.
+- **Por qué se descartó.** Con tres observadores fijos y conocidos en tiempo de compilación, la indirección de un bus de eventos genérico no aporta desacoplamiento adicional —ya se logra con la interfaz `ObservadorCambioEstado`— y sí dificulta rastrear en el código quién reacciona a qué cambio, el mismo costo de depuración que advierte la Guía sobre Observer con eventos. Con la lista inyectada, "buscar implementaciones" de la interfaz responde la pregunta en el IDE.
+- **Qué señal haría reconsiderar.** Que aparezcan observadores que deban ejecutarse de forma asíncrona o después del commit de la transacción (`@TransactionalEventListener`), o emisores distintos del servicio que publiquen el mismo evento. La integración externa de Contabilidad (ADR-001) es la candidata más probable a provocarlo.
+
+### 4.6 Visitor o Abstract Factory para exportar reportes en varios formatos *(referencia del enunciado)*
+
+- **Qué se consideró.** Anticipar que Contabilidad pediría exportar el historial de solicitudes en PDF y Excel además de CSV, y construir desde ahora una jerarquía de exportadores.
+- **Por qué se descartó.** El único formato del que se ha hablado es CSV (y la exportación ni siquiera hace parte de los tres requisitos implementados); no hay una segunda solicitud real de otro formato, así que no se cumple la Rule of Three (Guía, sección 4.2). Construir la abstracción ahora sería resolver un problema que todavía no existe, y con un solo formato no hay forma de saber qué tienen en común los exportadores.
+- **Qué señal haría reconsiderar.** La llegada del segundo formato justifica extraer una interfaz `ExportadorReporte` (un Strategy simple). Visitor solo si además el reporte debe recorrer estructuras heterogéneas, cosa que ningún requisito sugiere.
