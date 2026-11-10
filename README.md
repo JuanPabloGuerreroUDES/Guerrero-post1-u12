@@ -72,3 +72,36 @@ src/main/java/com/empresa/reembolsos/
 ├── infraestructura/    repositorio JPA
 └── adaptadores/rest/   controlador REST
 ```
+
+---
+
+## 2. Decisiones de diseño
+
+### Decisión 1 — Orden de la cadena de validadores
+
+**Decisión:** `documentos → monto → duplicados`. El eslabón más caro va **de último**.
+
+```java
+documentos.siguiente(monto).siguiente(duplicados);
+```
+
+**Criterio de eficiencia.** Los tres eslabones no cuestan lo mismo:
+
+| Eslabón | Qué hace | Costo |
+|---------|----------|-------|
+| `ValidadorDocumentosSoporte` | Lee un `boolean` de la solicitud | O(1) |
+| `ValidadorMontoMaximo` | Busca un tope en un mapa y compara dos `BigDecimal` | O(1) |
+| `ValidadorDuplicados` | Recorre la lista de solicitudes pendientes del empleado | O(n) |
+
+Como la cadena se corta en el primer rechazo, conviene que las verificaciones baratas filtren primero: una solicitud sin documentos o con el monto pasado de tope se rechaza sin llegar a recorrer la lista de pendientes.
+
+**Qué se gana y qué se pierde con cada orden:**
+
+| | Duplicados **al final** (elegido) | Duplicados **al inicio** |
+|---|---|---|
+| Se gana | Las solicitudes mal diligenciadas (el error más común) se rechazan en O(1). El motivo que ve el empleado es el más fácil de corregir por su cuenta: adjuntar el soporte o ajustar el monto. | El empleado se entera de inmediato de que ya tiene una solicitud en curso y no pierde tiempo corrigiendo una que igual sería rechazada. |
+| Se pierde | Un empleado puede corregir documentos y monto, y solo entonces enterarse de que la solicitud era un duplicado. | Se recorre la lista de pendientes para **todas** las solicitudes, incluso las que iban a caer por una verificación trivial. |
+
+Entre `documentos` y `monto` el costo es el mismo; se dejó `documentos` primero porque es el rechazo más frecuente y el más simple de explicar.
+
+**Límite honesto de esta decisión.** El orden solo ahorra el *recorrido* de la lista, no la *consulta* a la base de datos: el servicio carga los pendientes antes de invocar la cadena, porque así `ValidadorDuplicados` no necesita conocer el repositorio. Se aceptó ese costo a cambio de mantener `procesamiento.validacion` sin dependencias de infraestructura. Si la consulta llegara a pesar, la carga de pendientes se podría volver perezosa (`Supplier<List<...>>`) sin cambiar el orden de la cadena.
