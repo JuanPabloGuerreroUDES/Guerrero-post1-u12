@@ -7,6 +7,18 @@ Proyecto integrador de cierre de la materia. El área de Finanzas de una empresa
 
 Este README es el documento de diseño del proyecto: primero se analiza la especificación y se propone el diseño, y solo después se implementa.
 
+[![Validacion Arquitectonica](https://github.com/JuanPabloGuerreroUDES/Guerrero-post1-u12/actions/workflows/arquitectura.yml/badge.svg)](https://github.com/JuanPabloGuerreroUDES/Guerrero-post1-u12/actions/workflows/arquitectura.yml)
+
+## Contenido
+
+1. [Diseño Propuesto](#1-diseño-propuesto) — análisis previo al código
+2. [Decisiones de diseño](#2-decisiones-de-diseño) — decisiones 1 a 4
+3. [ADR-001 — Resumen de la decisión arquitectónica](#3-adr-001--resumen-de-la-decisión-arquitectónica)
+4. [Qué se descartó y por qué](#4-qué-se-descartó-y-por-qué) — análisis de impacto
+5. [Arquitectura resultante](#5-arquitectura-resultante)
+6. [Cómo ejecutar y probar](#6-cómo-ejecutar-y-probar)
+7. [Evidencia del pipeline](#7-evidencia-del-pipeline)
+
 ---
 
 ## 1. Diseño Propuesto
@@ -172,6 +184,38 @@ Además, `@AnalyzeClasses` usa `ImportOption.DoNotIncludeTests` para que las reg
 
 ---
 
+## 3. ADR-001 — Resumen de la decisión arquitectónica
+
+Documento completo: [`docs/adr/ADR-001.md`](docs/adr/ADR-001.md) · Estado: **Aceptado — 2026-11-10**
+
+**Pregunta.** ¿El sistema debe migrar a arquitectura Hexagonal completa (puertos para todas sus dependencias externas) o mantenerse en capas simples?
+
+**Criterio.** La Guía (sección 6.2) dice que Hexagonal vale la pena "en sistemas que sobrevivirán 3 años o más con cambios de infraestructura". Son dos condiciones y se evaluaron por separado para cada dependencia externa:
+
+| Dependencia | ¿Vivirá 3+ años? | ¿Cambio de infraestructura previsto? | Decisión |
+|-------------|------------------|--------------------------------------|----------|
+| Persistencia (JPA + H2) | Sí | **No** — no hay plan de cambiar de motor | **Capas simples.** El servicio depende directamente de `RepositorioSolicitudesJpa`; no se crea el puerto `RepositorioSolicitudes` |
+| Notificación a Contabilidad | Sí | **Sí** — API externa el próximo trimestre | **Sin cambios.** `ObservadorCambioEstado` ya es el seam que esa integración necesita |
+
+**Alternativas evaluadas.**
+
+| Alternativa | Resultado | Motivo |
+|-------------|-----------|--------|
+| A. Hexagonal completa | Rechazada | El puerto de persistencia tendría una sola implementación y un solo cliente; para aportar algo exigiría duplicar el modelo (entidad + mapper). Abstracción especulativa (YAGNI) |
+| B. Capas simples sin revisar la notificación | Rechazada | Ignora el único cambio de infraestructura que sí tiene fecha |
+| C. Capas simples en persistencia + seam existente en notificación | **Aceptada** | Abstrae solo donde hay un cambio real y documentado |
+
+**Consecuencias principales.**
+
+- ✅ No hay interfaces, entidades duplicadas ni mappers sin un caso de uso que los justifique.
+- ✅ La integración de Contabilidad será una implementación de `ObservadorCambioEstado`; no se toca el servicio ni los otros observadores.
+- ✅ Los límites que sí existen se verifican automáticamente con ArchUnit en cada push.
+- ⚠️ Si se cambia de motor de base de datos, el puerto habrá que introducirlo después. Deuda aceptada de forma consciente y acotada: un cliente, tres operaciones.
+- ⚠️ La asimetría (seam en notificación, ninguno en persistencia) puede parecer inconsistencia a quien no lea el ADR.
+- ⚠️ Los observadores corren de forma síncrona: cuando Contabilidad sea una API externa, su lentitud o caída afectaría la respuesta. Es lo primero a revisar cuando se conozca el contrato de esa API.
+
+---
+
 ## 4. Qué se descartó y por qué
 
 Durante el diseño y la implementación aparecieron varias alternativas más sofisticadas que las que quedaron en el código. Para cada una se aplicó la misma pregunta de la Guía (sección 4.2): **¿la variabilidad que la justificaría es real y está documentada hoy, o es especulación sobre un futuro que aún no llegó?**
@@ -223,3 +267,178 @@ Ningún descarte es definitivo: es la decisión vigente hoy, y cada uno indica q
 - **Qué se consideró.** Anticipar que Contabilidad pediría exportar el historial de solicitudes en PDF y Excel además de CSV, y construir desde ahora una jerarquía de exportadores.
 - **Por qué se descartó.** El único formato del que se ha hablado es CSV (y la exportación ni siquiera hace parte de los tres requisitos implementados); no hay una segunda solicitud real de otro formato, así que no se cumple la Rule of Three (Guía, sección 4.2). Construir la abstracción ahora sería resolver un problema que todavía no existe, y con un solo formato no hay forma de saber qué tienen en común los exportadores.
 - **Qué señal haría reconsiderar.** La llegada del segundo formato justifica extraer una interfaz `ExportadorReporte` (un Strategy simple). Visitor solo si además el reporte debe recorrer estructuras heterogéneas, cosa que ningún requisito sugiere.
+
+---
+
+## 5. Arquitectura resultante
+
+Capas simples con un paquete `procesamiento` aislado que contiene los tres patrones.
+
+```
+src/main/java/com/empresa/reembolsos/
+├── ReembolsosApplication.java
+├── dominio/                       modelo plano: sin Spring, sin JPA
+│   ├── SolicitudReembolso.java
+│   ├── CategoriaGasto.java
+│   └── EstadoSolicitud.java
+├── procesamiento/                 los tres patrones; no conoce BD ni web
+│   ├── validacion/                RF1 — Chain of Responsibility
+│   │   ├── ValidadorSolicitud.java          (eslabón abstracto)
+│   │   ├── ValidadorDocumentosSoporte.java
+│   │   ├── ValidadorMontoMaximo.java
+│   │   ├── ValidadorDuplicados.java
+│   │   ├── CadenaValidadores.java           (arma el orden)
+│   │   └── ResultadoValidacion.java
+│   ├── calculo/                   RF2 — Strategy
+│   │   ├── CalculadoraReembolso.java        (interfaz de la estrategia)
+│   │   ├── CalculadoraViaje.java
+│   │   ├── CalculadoraRepresentacion.java
+│   │   ├── CalculadoraCapacitacion.java
+│   │   └── SelectorCalculadora.java         (elige por categoría)
+│   └── notificacion/              RF3 — Observer
+│       ├── ObservadorCambioEstado.java      (interfaz del observador)
+│       ├── NotificadorEmpleado.java
+│       ├── NotificadorContabilidad.java
+│       └── NotificadorAuditoria.java
+├── aplicacion/                    único coordinador de los tres patrones
+│   ├── SolicitudReembolsoService.java
+│   └── SolicitudInvalidaException.java
+├── infraestructura/
+│   └── RepositorioSolicitudesJpa.java
+└── adaptadores/rest/
+    ├── SolicitudReembolsoController.java
+    └── ManejadorErroresRest.java
+
+src/main/resources/META-INF/orm.xml    mapeo JPA de SolicitudReembolso, fuera del dominio
+docs/adr/ADR-001.md                    decisión arquitectónica
+.github/workflows/arquitectura.yml     pipeline de validación
+```
+
+**Dirección de las dependencias** (las flechas significan "depende de"):
+
+```
+adaptadores.rest ──► aplicacion ──► procesamiento ──► dominio
+                         │                               ▲
+                         └──► infraestructura ───────────┘
+```
+
+- `dominio` no depende de nadie.
+- `procesamiento` solo depende de `dominio`. Lo verifica la regla `procesamientoSinPersistenciaNiWeb`.
+- `aplicacion` es el único paquete que conoce a la vez los patrones y el repositorio.
+- `adaptadores.rest` solo habla con `aplicacion` y `dominio`. Lo verifica la regla `controladorSoloUsaServicio`.
+
+**Flujo de una solicitud:**
+
+1. `POST /api/solicitudes` → el servicio carga las solicitudes pendientes del empleado.
+2. La **cadena** valida: documentos → monto → duplicados. Al primer rechazo responde HTTP 422 con el motivo.
+3. El **selector** entrega la calculadora de la categoría y esta calcula el monto aprobado.
+4. La solicitud se guarda en estado `PENDIENTE`.
+5. `PUT /api/solicitudes/{id}/estado` → se guarda el nuevo estado y se avisa a **todos** los observadores; cada uno decide si reacciona.
+
+**Cómo se extiende cada requisito sin tocar lo existente:**
+
+| Cambio anunciado por Finanzas | Qué se agrega | Qué se modifica |
+|-------------------------------|---------------|-----------------|
+| Verificación de límite anual acumulado (RF1) | `ValidadorLimiteAnual extends ValidadorSolicitud` | Una línea en `CadenaValidadores` para engancharlo; ningún validador existente |
+| Categoría "bienestar" (RF2) | `CalculadoraBienestar implements CalculadoraReembolso` | El enum `CategoriaGasto` y el tope en `ValidadorMontoMaximo`; ninguna calculadora existente |
+| Panel de métricas (RF3) | `NotificadorPanelMetricas implements ObservadorCambioEstado` | Nada |
+
+---
+
+## 6. Cómo ejecutar y probar
+
+**Requisitos:** Java 17 o superior y Maven 3.9+.
+
+```bash
+mvn spring-boot:run
+```
+
+La aplicación queda en `http://localhost:8080` con una base de datos H2 en memoria.
+
+**Crear una solicitud** (capacitación: se aprueba el 80 %, es decir `800000`):
+
+```bash
+curl -X POST http://localhost:8080/api/solicitudes -H "Content-Type: application/json" -d '{"empleadoId":"EMP-001","categoria":"CAPACITACION","montoSolicitado":1000000,"fechaGasto":"2026-11-05","diasViaje":0,"documentosSoporte":true}'
+```
+
+**Solicitud sin documentos soporte** (responde HTTP 422 con `"detail": "Faltan documentos soporte"`):
+
+```bash
+curl -X POST http://localhost:8080/api/solicitudes -H "Content-Type: application/json" -d '{"empleadoId":"EMP-002","categoria":"VIAJE","montoSolicitado":100000,"fechaGasto":"2026-11-05","diasViaje":2,"documentosSoporte":false}'
+```
+
+**Cambiar el estado** (dispara a los tres observadores; se ve en la consola):
+
+```bash
+curl -X PUT http://localhost:8080/api/solicitudes/1/estado -H "Content-Type: application/json" -d '"APROBADA"'
+```
+
+```
+... c.e.r.p.n.NotificadorAuditoria : Auditoria: solicitud 1 cambio de PENDIENTE a APROBADA
+Contabilidad: programar pago de 800000.00 para EMP-001
+Notificando a EMP-001: su solicitud paso de PENDIENTE a APROBADA
+```
+
+Con `"RECHAZADA"` en lugar de `"APROBADA"` aparecen las líneas de Auditoría y del empleado, pero no la de Contabilidad.
+
+### Pruebas
+
+```bash
+mvn verify
+```
+
+```bash
+mvn test -Dtest=ReglasArquitectura
+```
+
+| Tipo | Clases | Pruebas |
+|------|--------|---------|
+| Unitarias — validadores (RF1) | `ValidadorDocumentosSoporteTest`, `ValidadorMontoMaximoTest`, `ValidadorDuplicadosTest`, `CadenaValidadoresTest` | 16 |
+| Unitarias — calculadoras (RF2) | `CalculadoraViajeTest`, `CalculadoraRepresentacionTest`, `CalculadoraCapacitacionTest`, `SelectorCalculadoraTest` | 12 |
+| Unitarias — notificadores (RF3) | `NotificadoresTest` | 10 |
+| Integración `@SpringBootTest` | `FlujoSolicitudReembolsoIntegracionTest` — flujo completo por HTTP para las 3 categorías, los 3 rechazos y la notificación | 7 |
+| Arquitectura (ArchUnit) | `ReglasArquitectura` | 4 |
+
+Las pruebas unitarias instancian las clases con `new`, sin Spring ni base de datos: es la consecuencia práctica de que `procesamiento` no dependa de infraestructura.
+
+`ReglasArquitectura` no sigue el patrón de nombre `*Test` de Surefire, por lo que se ejecuta con `-Dtest=ReglasArquitectura`; el pipeline la corre en un paso propio antes de la suite completa.
+
+---
+
+## 7. Evidencia del pipeline
+
+El workflow [`.github/workflows/arquitectura.yml`](.github/workflows/arquitectura.yml) corre en cada push a `main`: primero las 4 reglas ArchUnit y después la suite completa con `mvn verify`.
+
+Para comprobar que el pipeline detecta de verdad una violación, se introdujo una a propósito: un campo de tipo `RepositorioSolicitudesJpa` dentro de `ValidadorDuplicados`, que rompe la Regla 1 (`procesamiento` no puede depender de `infraestructura`). Un `import` sin usar no habría bastado: ArchUnit analiza el bytecode y un import que no se usa no deja rastro en él.
+
+| Ejecución | Commit | Resultado | Detalle |
+|-----------|--------|-----------|---------|
+| [#1](https://github.com/JuanPabloGuerreroUDES/Guerrero-post1-u12/actions/runs/42879351701) | `84691db` ci: agregar workflow de GitHub Actions | ✅ Éxito | Línea base: reglas y suite completa en verde |
+| [#2](https://github.com/JuanPabloGuerreroUDES/Guerrero-post1-u12/actions/runs/42879753411) | `94d0c32` test: violacion de arquitectura intencional | ❌ Fallo | Falla el paso "Ejecutar reglas de arquitectura"; la suite completa ni siquiera llega a ejecutarse |
+| [#3](https://github.com/JuanPabloGuerreroUDES/Guerrero-post1-u12/actions/runs/42880063643) | `5b939b4` Revert "test: violacion de arquitectura intencional" | ✅ Éxito | El pipeline vuelve a verde tras el `git revert` |
+
+**Historial de GitHub Actions** — build fallido por la violación intencional entre dos builds en verde:
+
+![Historial de GitHub Actions con el build fallido y el build en verde tras el revert](docs/evidencias/01-historial-actions.png)
+
+**Build #2 — fallido por la violación intencional de la Regla 1:**
+
+![Build fallido por la violación intencional](docs/evidencias/02-build-fallido-violacion.png)
+
+Mensaje de ArchUnit para esa violación (salida de `mvn test -Dtest=ReglasArquitectura` sobre el commit `94d0c32`):
+
+```
+[ERROR] ReglasArquitectura.procesamientoSinPersistenciaNiWeb Architecture Violation [Priority: MEDIUM] -
+Rule 'no classes that reside in a package '..procesamiento..' should depend on classes that reside in
+any package ['..infraestructura..', '..adaptadores..', 'org.springframework.data..', 'jakarta.persistence..']'
+was violated (1 times):
+Field <com.empresa.reembolsos.procesamiento.validacion.ValidadorDuplicados.repositorio> has type
+<com.empresa.reembolsos.infraestructura.RepositorioSolicitudesJpa> in (ValidadorDuplicados.java:0)
+
+[ERROR] Tests run: 4, Failures: 1, Errors: 0, Skipped: 0
+[INFO] BUILD FAILURE
+```
+
+**Build #3 — en verde tras revertir la violación:**
+
+![Build en verde tras el revert](docs/evidencias/03-build-verde-tras-revert.png)
