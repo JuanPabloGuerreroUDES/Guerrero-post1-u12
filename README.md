@@ -132,3 +132,40 @@ Solo la primera opción cumple el requisito sin tocar una línea ya escrita del 
 - El valor nuevo en el enum `CategoriaGasto` sí hay que agregarlo; eso es dominio, no cálculo, y es inevitable en ambas opciones.
 - La relación categoría → calculadora ya no se lee en un solo lugar; hay que buscar las implementaciones de la interfaz. Con tres clases en un paquete es un costo menor.
 - Si dos calculadoras declaran la misma categoría, `Collectors.toMap` lanza `IllegalStateException` y la aplicación **no arranca**. Se considera una ventaja: el error aparece al desplegar y no con la solicitud de un empleado.
+- Una categoría nueva también necesita su tope en `ValidadorMontoMaximo` (RF1). Eso es una línea en el mapa de topes de la validación; las fórmulas de las categorías existentes, que es lo que protege el RF2, no se tocan.
+
+### Decisión 3 — Capas simples o Hexagonal
+
+Documentada en [`docs/adr/ADR-001.md`](docs/adr/ADR-001.md) y resumida en la [sección 3](#3-adr-001--resumen-de-la-decisión-arquitectónica).
+
+### Decisión 4 — Por qué la Regla 1 no prohíbe todo `org.springframework`
+
+**Decisión:** la Regla 1 de ArchUnit prohíbe que `procesamiento` dependa de `..infraestructura..`, `..adaptadores..`, `org.springframework.data..` y `jakarta.persistence..`, pero **permite** las anotaciones de estereotipo (`@Component`).
+
+**Justificación.** Lo que la regla protege no es la "pureza" del paquete sino una propiedad concreta: que los tres patrones se puedan entender, probar y cambiar sin base de datos y sin web. Las dos clases de dependencia afectan esa propiedad de forma muy distinta:
+
+| | Anotación de estereotipo (`@Component`) | Acceso a datos o capa web (`JpaRepository`, `EntityManager`, `@Entity`, controladores) |
+|---|---|---|
+| Qué es | Metadato: le dice al contenedor "regístrame" | Capacidad: le permite a la clase hacer entrada/salida |
+| ¿Cambia lo que la clase hace? | No. La clase se comporta igual con o sin Spring | Sí. La clase pasa a consultar o escribir fuera de sí misma |
+| ¿Se puede probar con `new`? | Sí — así lo hacen las pruebas unitarias de este proyecto (`new ValidadorDuplicados()`, `new CalculadoraViaje()`) | No sin simular el repositorio o levantar una base de datos |
+| ¿Invierte la dirección de dependencias? | No | Sí: `procesamiento` empezaría a conocer a `infraestructura` |
+
+Prohibir cualquier import de `org.springframework` habría tenido un costo real y ningún beneficio:
+
+1. **Rompería la Decisión 2.** Sin `@Component`, cada validador, calculadora y notificador tendría que registrarse a mano en una clase `@Configuration` con un método `@Bean` por cada uno. Agregar la categoría "bienestar" o el observador del panel de métricas volvería a exigir modificar un archivo existente, justo lo que RF2 y RF3 piden evitar.
+2. **Castigaría algo que no hace daño.** Una regla que marca como violación un `@Component` inofensivo termina desactivada o llena de excepciones, y entonces deja de detectar lo que sí importa.
+3. **Sería acoplamiento solo nominal.** Si algún día se cambiara de framework, quitar una anotación por clase es mecánico; desenredar un `JpaRepository` usado dentro de un validador no lo es.
+
+**Límite de la regla tal como está escrita.** Prohíbe las dependencias que hoy existen en el proyecto y que harían daño (Spring Data, JPA, los paquetes propios de infraestructura y adaptadores). No lista, por ejemplo, `org.springframework.web..` ni `org.springframework.jdbc..`: hoy ninguna clase de `procesamiento` tiene motivo para usarlas y agregar prohibiciones para casos que no han ocurrido sería ruido. Si la integración de Contabilidad (ADR-001) trae un cliente HTTP, ese será el momento de ampliar la regla.
+
+#### Ajustes a las reglas ArchUnit respecto al enunciado
+
+Al ejecutar las reglas contra el código real aparecieron dos falsos positivos. Se corrigió la regla y no el código, porque en ambos casos el código cumplía la intención de la regla:
+
+| Regla | Qué fallaba | Ajuste |
+|-------|-------------|--------|
+| `controladorSoloUsaServicio` | ArchUnit cuenta como "acceso" que el controlador lea y escriba su propio campo `servicio`, que está en `adaptadores.rest` | Se agregó `..adaptadores.rest..` a los paquetes permitidos |
+| `calculadorasImplementanInterfaz` | `SelectorCalculadora` vive en `procesamiento.calculo` pero no es una estrategia, es quien las elige | La regla aplica a las clases cuyo nombre empieza por `Calculadora` |
+
+Además, `@AnalyzeClasses` usa `ImportOption.DoNotIncludeTests` para que las reglas evalúen solo código de producción: las clases de prueba (`CalculadoraViajeTest`, etc.) comparten paquete con las calculadoras y no implementan la interfaz.
