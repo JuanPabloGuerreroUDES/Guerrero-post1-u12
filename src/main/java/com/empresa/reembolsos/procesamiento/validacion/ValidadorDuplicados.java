@@ -1,6 +1,7 @@
 package com.empresa.reembolsos.procesamiento.validacion;
 
 import com.empresa.reembolsos.dominio.SolicitudReembolso;
+import com.empresa.reembolsos.infraestructura.RepositorioSolicitudesJpa;
 import org.springframework.stereotype.Component;
 
 import java.time.YearMonth;
@@ -16,6 +17,9 @@ import java.util.List;
  */
 @Component
 public class ValidadorDuplicados extends ValidadorSolicitud {
+
+    // VIOLACION INTENCIONAL de la Regla 1: procesamiento no debe conocer infraestructura
+    private RepositorioSolicitudesJpa repositorio;
 
     @Override
     protected ResultadoValidacion validarPropio(SolicitudReembolso solicitud,
