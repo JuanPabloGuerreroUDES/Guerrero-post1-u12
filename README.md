@@ -104,4 +104,31 @@ Como la cadena se corta en el primer rechazo, conviene que las verificaciones ba
 
 Entre `documentos` y `monto` el costo es el mismo; se dejó `documentos` primero porque es el rechazo más frecuente y el más simple de explicar.
 
-**Límite honesto de esta decisión.** El orden solo ahorra el *recorrido* de la lista, no la *consulta* a la base de datos: el servicio carga los pendientes antes de invocar la cadena, porque así `ValidadorDuplicados` no necesita conocer el repositorio. Se aceptó ese costo a cambio de mantener `procesamiento.validacion` sin dependencias de infraestructura. Si la consulta llegara a pesar, la carga de pendientes se podría volver perezosa (`Supplier<List<...>>`) sin cambiar el orden de la cadena.
+**Límite de esta decisión.** El orden solo ahorra el *recorrido* de la lista, no la *consulta* a la base de datos: el servicio carga los pendientes antes de invocar la cadena, porque así `ValidadorDuplicados` no necesita conocer el repositorio. Se aceptó ese costo a cambio de mantener `procesamiento.validacion` sin dependencias de infraestructura. Si la consulta llegara a pesar, la carga de pendientes se podría volver perezosa (`Supplier<List<...>>`) sin cambiar el orden de la cadena.
+
+### Decisión 2 — Mecanismo de selección de la calculadora
+
+**Decisión:** un mapa `CategoriaGasto → CalculadoraReembolso` construido a partir de la `List<CalculadoraReembolso>` que Spring inyecta con todos los `@Component` registrados. Se descartó el `switch` manual.
+
+```java
+public SelectorCalculadora(List<CalculadoraReembolso> lista) {
+    this.calculadoras = lista.stream()
+        .collect(Collectors.toMap(CalculadoraReembolso::getCategoria, Function.identity()));
+}
+```
+
+**Justificación contra el RF2.** El requisito dice que Finanzas agregará categorías "sin modificar el cálculo de las categorías existentes". Comparando qué hay que tocar para agregar la categoría "bienestar":
+
+| | Mapa desde `List` inyectada (elegido) | `switch` sobre `CategoriaGasto` |
+|---|---|---|
+| Archivos **nuevos** | `CalculadoraBienestar.java` | `CalculadoraBienestar.java` |
+| Archivos **modificados** del cálculo | Ninguno | `SelectorCalculadora` (un `case` más) |
+| Si se olvida registrar la categoría | No se puede olvidar: el `@Component` se registra solo | Compila igual y falla en tiempo de ejecución con la primera solicitud |
+
+Solo la primera opción cumple el requisito sin tocar una línea ya escrita del paquete `calculo`: cada calculadora declara su propia categoría con `getCategoria()` y el selector no conoce ninguna implementación concreta. Es el principio abierto/cerrado aplicado donde el requisito lo pide de forma explícita, no por anticipación.
+
+**Costos aceptados:**
+
+- El valor nuevo en el enum `CategoriaGasto` sí hay que agregarlo; eso es dominio, no cálculo, y es inevitable en ambas opciones.
+- La relación categoría → calculadora ya no se lee en un solo lugar; hay que buscar las implementaciones de la interfaz. Con tres clases en un paquete es un costo menor.
+- Si dos calculadoras declaran la misma categoría, `Collectors.toMap` lanza `IllegalStateException` y la aplicación **no arranca**. Se considera una ventaja: el error aparece al desplegar y no con la solicitud de un empleado.
